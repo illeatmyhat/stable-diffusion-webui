@@ -22,7 +22,7 @@ Features:
 # Stable Diffusion web UI
 A browser interface based on Gradio library for Stable Diffusion.
 
-Original script with Gradio UI was written by a kind anonymopus user. This is a modification.
+Original script with Gradio UI was written by a kind anonymous user. This is a modification.
 
 ![](images/txt2img.jpg)
 
@@ -32,17 +32,42 @@ Original script with Gradio UI was written by a kind anonymopus user. This is a 
 
 ![](images/esrgan.jpg)
 
-### GFPGAN
+## Installing and running
 
-If you want to use GFPGAN to improve generated faces, you need to install it separately.
-Download [GFPGANv1.3.pth](https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth) and put it
-into the `/stable-diffusion/src/gfpgan/experiments/pretrained_models` directory. 
+The models are automatically downloaded for you. Don't worry about it.
+In general, you should be able to just [install miniconda](https://docs.conda.io/en/latest/miniconda.html)
+and run:
 
-### RealESRGAN
-Download [RealESRGAN_x4plus.pth](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth) and [RealESRGAN_x4plus_anime_6B.pth](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth).
-Put them into the `stable-diffusion/src/realesrgan/experiments/pretrained_models` directory. 
+```
+conda create -n stable-diffusion-webui python=3.9
+conda activate stable-diffusion-webui
+pip install --upgrade pip
+pip install -e . --upgrade --use-deprecated=legacy-resolver --only-binary numpy
+
+stable-diffusion --optimize-memory
+```
+
+If you have a GPU, you may need to install [PyTorch separately](https://pytorch.org/get-started/locally/)
+
+### Stable Diffusion
+
+This script assumes that you already have main Stable Diffusion stuff installed, assumed to be in directory `/sd`.
+If you don't have it installed, follow the guide:
+
+- https://rentry.org/kretard
+
+This repository's `webgui.py` is a replacement for `kdiff.py` from the guide.
 
 ### Web UI
+
+Run in the command line:
+
+`stable-diffusion`
+
+When running the script, models will automatically be downloaded and cached into the `"./models"` directory.
+This can be changed like so:
+
+`stable-diffusion --models-root "./other/models"`
 
 When launching, you may get a very long warning message related to some weights not being used. You may freely ignore it.
 After a while, you will get a message like this:

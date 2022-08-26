@@ -4,19 +4,16 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--outdir", type=str, nargs="?", help="dir to write results to", default=None)
 parser.add_argument("--outdir_txt2img", type=str, nargs="?", help="dir to write txt2img results to (overrides --outdir)", default=None)
 parser.add_argument("--outdir_img2img", type=str, nargs="?", help="dir to write img2img results to (overrides --outdir)", default=None)
-parser.add_argument("--save-metadata", action='store_true', help="Whether to embed the generation parameters in the sample images", default=False)
-parser.add_argument("--skip-grid", action='store_true', help="do not save a grid, only individual samples. Helpful when evaluating lots of samples", default=False)
-parser.add_argument("--skip-save", action='store_true', help="do not save indiviual samples. For speed measurements.", default=False)
+parser.add_argument("--save_metadata", action='store_true', help="Whether to embed the generation parameters in the sample images", default=False)
+parser.add_argument("--skip_grid", action='store_true', help="do not save a grid, only individual samples. Helpful when evaluating lots of samples", default=False)
+parser.add_argument("--skip_save", action='store_true', help="do not save indiviual samples. For speed measurements.", default=False)
 parser.add_argument("--n_rows", type=int, default=-1, help="rows in the grid; use -1 for autodetect and 0 for n_rows to be same as batch_size (default: -1)",)
-parser.add_argument("--config", type=str, default="configs/stable-diffusion/v1-inference.yaml", help="path to config which constructs model",)
-parser.add_argument("--ckpt", type=str, default="models/ldm/stable-diffusion-v1/model.ckpt", help="path to checkpoint of model",)
+parser.add_argument("--models-root", type=str, default="./models", help='where your "./models" directory is located.',)
 parser.add_argument("--precision", type=str, help="evaluate at this precision", choices=["full", "autocast"], default="autocast")
-parser.add_argument("--gfpgan-dir", type=str, help="GFPGAN directory", default=('./src/gfpgan' if os.path.exists('./src/gfpgan') else './GFPGAN')) # i disagree with where you're putting it but since all guidefags are doing it this way, there you go
-parser.add_argument("--realesrgan-dir", type=str, help="RealESRGAN directory", default=('./src/realesrgan' if os.path.exists('./src/realesrgan') else './RealESRGAN'))
-parser.add_argument("--realesrgan-model", type=str, help="Upscaling model for RealESRGAN", default=('RealESRGAN_x4plus'))
+parser.add_argument("--optimize-memory", action='store_true', help="Optimize memory usage. For those with GPUs that only have 4GB VRAM.")
 parser.add_argument("--no-verify-input", action='store_true', help="do not verify input to check if it's too long", default=False)
 parser.add_argument("--no-half", action='store_true', help="do not switch the model to 16-bit floats", default=False)
-parser.add_argument("--no-progressbar-hiding", action='store_true', help="do not hide progressbar in gradio UI (we hide it because it slows down ML if you have hardware accleration in browser)", default=False)
+parser.add_argument("--no-progressbar-hiding", action='store_true', help="do not hide progressbar in gradio UI (we hide it because it slows down ML if you have hardware accleration in browser)")
 parser.add_argument("--defaults", type=str, help="path to configuration file providing UI defaults, uses same format as cli parameter", default='configs/webui/webui.yaml')
 parser.add_argument("--gpu", type=int, help="choose which GPU to use if you have multiple", default=0)
 parser.add_argument("--extra-models-cpu", action='store_true', help="run extra models (GFGPAN/ESRGAN) on cpu", default=False)
@@ -30,6 +27,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
 
 import gradio as gr
 import k_diffusion as K
+import logging
 import math
 import mimetypes
 import numpy as np
@@ -43,10 +41,9 @@ import yaml
 import glob
 from typing import List, Union
 
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from einops import rearrange, repeat
 from itertools import islice
-from omegaconf import OmegaConf
 from PIL import Image, ImageFont, ImageDraw, ImageFilter, ImageOps
 from PIL.PngImagePlugin import PngInfo
 from io import BytesIO
@@ -55,15 +52,17 @@ import re
 from torch import autocast
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
-from ldm.util import instantiate_from_config
+from ldm.util import torch_device, instantiate_from_config
+from stable_diffusion.models import Models
+from stable_diffusion.configs import stable_diffusion_v1_optimized
 
 try:
     # this silences the annoying "Some weights of the model checkpoint were not used when initializing..." message at start.
-
-    from transformers import logging
-    logging.set_verbosity_error()
+    from transformers import logging as huggingface_logging
+    huggingface_logging.set_verbosity_error()
 except:
     pass
+logging.basicConfig(level=logging.INFO)
 
 # this is a fix for Windows users. Without it, javascript files will be served with text/html content-type and the bowser will not show any UI
 mimetypes.init()
@@ -75,9 +74,6 @@ opt_f = 8
 
 LANCZOS = (Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
 invalid_filename_chars = '<>:"/\|?*\n'
-
-GFPGAN_dir = opt.gfpgan_dir
-RealESRGAN_dir = opt.realesrgan_dir
 
 css_hide_progressbar = """
 .wrap .m-12 svg { display:none!important; }
@@ -91,25 +87,6 @@ def chunk(it, size):
     return iter(lambda: tuple(islice(it, size)), ())
 
 
-def load_model_from_config(config, ckpt, verbose=False):
-    print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
-    model = instantiate_from_config(config.model)
-    m, u = model.load_state_dict(sd, strict=False)
-    if len(m) > 0 and verbose:
-        print("missing keys:")
-        print(m)
-    if len(u) > 0 and verbose:
-        print("unexpected keys:")
-        print(u)
-
-    model.cuda()
-    model.eval()
-    return model
-
 def crash(e, s):
     global model
     global device
@@ -122,6 +99,7 @@ def crash(e, s):
     print('exiting...calling os._exit(0)')
     t = threading.Timer(0.25, os._exit, args=[0])
     t.start()
+
 
 class MemUsageMonitor(threading.Thread):
     stop_flag = False
@@ -201,80 +179,128 @@ def create_random_tensors(shape, seeds):
     x = torch.stack(xs)
     return x
 
+
 def torch_gc():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
-def load_GFPGAN():
-    model_name = 'GFPGANv1.3'
-    model_path = os.path.join(GFPGAN_dir, 'experiments/pretrained_models', model_name + '.pth')
-    if not os.path.isfile(model_path):
-        raise Exception("GFPGAN model not found at path "+model_path)
 
-    sys.path.append(os.path.abspath(GFPGAN_dir))
+device = torch_device
+
+
+def load_gfpgan():
+    models = Models(Path(opt.models_root))
+    models.download(Models.gfpgan)
+    model_path = models.storage_dir / Models.gfpgan.download_path()
+    if not model_path.exists():
+        raise Exception(f"GFPGAN model not found at path {model_path}")
+
     from gfpgan import GFPGANer
-    instance = GFPGANer(model_path=model_path, upscale=1, arch='clean', channel_multiplier=2, bg_upsampler=None)
+    instance = GFPGANer(model_path=str(model_path), upscale=1, arch='clean', channel_multiplier=2, bg_upsampler=None)
     if opt.gfpgan_cpu or opt.extra_models_cpu:
         instance.device = torch.device('cpu')
     else:
-        instance.device = torch.device(f'cuda:{opt.gpu}') # another way to set gpu device
+        instance.device = torch_device # another way to set gpu device
     return instance
 
-def load_RealESRGAN(model_name: str):
+def load_realesrgan(model_name: str):
     from basicsr.archs.rrdbnet_arch import RRDBNet
-    RealESRGAN_models = {
+    models = Models(Path(opt.models_root))
+    models.download(Models.realesrgan)
+    models.download(Models.realesrgan_anime)
+
+    realesrgan_paths = {
+        'RealESRGAN_x4plus': models.storage_dir / Models.realesrgan.download_path(),
+        'RealESRGAN_x4plus_anime_6B': models.storage_dir / Models.realesrgan_anime.download_path()
+    }
+
+    if not realesrgan_paths['RealESRGAN_x4plus'].exists():
+        raise Exception(f"RealESRGAN_x4plus model not found at path {realesrgan_paths['RealESRGAN_x4plus']}")
+    if not realesrgan_paths['RealESRGAN_x4plus_anime_6B'].exists():
+        raise Exception(f"RealESRGAN_x4plus model not found at path {realesrgan_paths['RealESRGAN_x4plus_anime_6B']}")
+
+    realesrgan_models = {
         'RealESRGAN_x4plus': RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4),
         'RealESRGAN_x4plus_anime_6B': RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)
     }
 
-    model_path = os.path.join(RealESRGAN_dir, 'experiments/pretrained_models', model_name + '.pth')
-    if not os.path.isfile(model_path):
-        raise Exception(model_name+".pth not found at path "+model_path)
-
-    sys.path.append(os.path.abspath(RealESRGAN_dir))
     from realesrgan import RealESRGANer
 
     if opt.esrgan_cpu or opt.extra_models_cpu:
-        instance = RealESRGANer(scale=2, model_path=model_path, model=RealESRGAN_models[model_name], pre_pad=0, half=False)
+        instance = RealESRGANer(scale=2, model_path=str(realesrgan_paths[model_name]), model=realesrgan_models[model_name], pre_pad=0, half=False)
         instance.model.name = model_name
-        instance.device = torch.device('cpu')
         instance.device = torch.device('cpu')
         instance.model.to('cpu')
     else:
-        instance = RealESRGANer(scale=2, model_path=model_path, model=RealESRGAN_models[model_name], pre_pad=0, half=not opt.no_half)
+        instance = RealESRGANer(scale=2, model_path=str(realesrgan_paths[model_name]), model=realesrgan_models[model_name], pre_pad=0, half=not opt.no_half)
         instance.model.name = model_name
         instance.device = torch.device(f'cuda:{opt.gpu}') # another way to set gpu device
 
     return instance
 
-GFPGAN = None
-if os.path.exists(GFPGAN_dir):
-    try:
-        GFPGAN = load_GFPGAN()
-        print("Loaded GFPGAN")
-    except Exception:
-        import traceback
-        print("Error loading GFPGAN:", file=sys.stderr)
-        print(traceback.format_exc(), file=sys.stderr)
 
-RealESRGAN = None
-def try_loading_RealESRGAN(model_name: str):
-    global RealESRGAN
-    if os.path.exists(RealESRGAN_dir):
-        try:
-            RealESRGAN = load_RealESRGAN(model_name) # TODO: Should try to load both models before giving up
-            print("Loaded RealESRGAN with model "+RealESRGAN.model.name)
-        except Exception:
-            import traceback
-            print("Error loading RealESRGAN:", file=sys.stderr)
-            print(traceback.format_exc(), file=sys.stderr)
-try_loading_RealESRGAN('RealESRGAN_x4plus')
+GFPGAN = load_gfpgan()
+RealESRGAN = load_realesrgan('RealESRGAN_x4plus')
 
-config = OmegaConf.load("configs/stable-diffusion/v1-inference.yaml")
-model = load_model_from_config(config, "models/ldm/stable-diffusion-v1/model.ckpt")
+models = Models(Path(opt.models_root))
+models.download(Models.stable_diffusion_v1)
+if opt.optimize_memory:
+    state_dict = torch.load(models.storage_dir / Models.stable_diffusion_v1.download_path(), map_location='cpu')
+    if 'global_step' in state_dict:
+        print(f"Global Step: {state_dict['global_step']}")
+    state_dict = state_dict['state_dict']
+    li = []
+    lo = []
+    for key, value in state_dict.items():
+        sp = key.split('.')
+        if (sp[0]) == 'model':
+            if 'input_blocks' in sp:
+                li.append(key)
+            elif 'middle_block' in sp:
+                li.append(key)
+            elif 'time_embed' in sp:
+                li.append(key)
+            else:
+                lo.append(key)
+    for key in li:
+        state_dict['model1.' + key[6:]] = state_dict.pop(key)
+    for key in lo:
+        state_dict['model2.' + key[6:]] = state_dict.pop(key)
 
-device = torch.device(f"cuda") if torch.cuda.is_available() else torch.device("cpu")
-model = (model if opt.no_half else model.half()).to(device)
+    model = instantiate_from_config(stable_diffusion_v1_optimized.modelUNet)
+    _, _ = model.load_state_dict(state_dict, strict=False)
+    model = model.eval()
+    model = (model if opt.no_half else model.half()).to(device)
+
+    model_cond_stage = instantiate_from_config(stable_diffusion_v1_optimized.modelCondStage)
+    _, _ = model_cond_stage.load_state_dict(state_dict, strict=False)
+    model_cond_stage = model_cond_stage.eval()
+    model_cond_stage = (model_cond_stage if opt.no_half else model_cond_stage.half()).to(device)
+
+    model_first_stage = instantiate_from_config(stable_diffusion_v1_optimized.modelFirstStage)
+    _, _ = model_first_stage.load_state_dict(state_dict, strict=False)
+    model_first_stage = model_first_stage.eval()
+else:
+    model = models.load_model(Models.stable_diffusion_v1)
+    model_cond_stage = model
+    model_first_stage = model
+
+if device.type == 'cpu':
+    # TODO: use Intel IPEX compiler to shave off a minute from compute time
+    # cpu = CPUID().get_vendor_id()
+    # if device.type == 'cpu' and 'Intel' in cpu:
+    #   model = ipex.optimize(model)
+    logging.info(textwrap.dedent("""
+        You're using a CPU! Expect it to take 15-30 minutes to generate one 512x512 image.
+        At least you probably have more RAM than the GPU users :^)
+        If you have a GPU, you may need to install some PyTorch dependencies https://pytorch.org/get-started/locally/
+    """).lstrip())
+else:
+    # TODO: rather than having switches, we should just detect people's hardware and do the right thing.
+    model = (model if opt.no_half else model.half()).to(device)
+    model_cond_stage = (model_cond_stage if opt.no_half else model_cond_stage.half()).to(device)
+
 
 def load_embeddings(fp):
     if fp is not None and hasattr(model, "embedding_manager"):
@@ -425,10 +451,10 @@ def resize_image(resize_mode, im, width, height):
 def check_prompt_length(prompt, comments):
     """this function tests if prompt is too long, and if so, adds a message to comments"""
 
-    tokenizer = model.cond_stage_model.tokenizer
-    max_length = model.cond_stage_model.max_length
+    tokenizer = model_cond_stage.cond_stage_model.tokenizer
+    max_length = model_cond_stage.cond_stage_model.max_length
 
-    info = model.cond_stage_model.tokenizer([prompt], truncation=True, max_length=max_length, return_overflowing_tokens=True, padding="max_length", return_tensors="pt")
+    info = model_cond_stage.cond_stage_model.tokenizer([prompt], truncation=True, max_length=max_length, return_overflowing_tokens=True, padding="max_length", return_tensors="pt")
     ovf = info['overflowing_tokens'][0]
     overflowing_count = ovf.shape[0]
     if overflowing_count == 0:
@@ -498,10 +524,18 @@ def process_images(
         all_prompts = batch_size * n_iter * [prompt]
         all_seeds = [seed + x for x in range(len(all_prompts))]
 
-    precision_scope = autocast if opt.precision == "autocast" else nullcontext
+    if device.type in ['mps', 'cpu']:
+        # PyTorch did not implement FP16 CPU operations in their C library.
+        # Apple's Metal Performance Shaders don't support FP16 either.
+        precision_scope = nullcontext
+    else:
+        # while there are technically Xeon CPUs which support BF16 operations,
+        # in practice, only Nvidia Ampere (3000 series) and newer GPUs will work with autocast.
+        # everyone else will have to cope with FP16.
+        precision_scope = autocast if opt.precision == "autocast" else nullcontext
     output_images = []
     stats = []
-    with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
+    with torch.no_grad(), precision_scope(device.type):
         init_data = func_init()
         tic = time.time()
 
@@ -509,7 +543,9 @@ def process_images(
             prompts = all_prompts[n * batch_size:(n + 1) * batch_size]
             seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
 
-            uc = model.get_learned_conditioning(len(prompts) * [""])
+            if opt.optimize_memory and device.type != 'cpu':
+                model_cond_stage.to(device)
+            uc = model_cond_stage.get_learned_conditioning(len(prompts) * [""])
             if isinstance(prompts, tuple):
                 prompts = list(prompts)
 
@@ -528,9 +564,16 @@ def process_images(
                         weight = weight / totalPromptWeight
                     #print(f"{subprompts[i]} {weight*100.0}%")
                     # note if alpha negative, it functions same as torch.sub
-                    c = torch.add(c,model.get_learned_conditioning(subprompts[i]), alpha=weight)
+                    c = torch.add(c,model_cond_stage.get_learned_conditioning(subprompts[i]), alpha=weight)
             else: # just behave like usual
-                c = model.get_learned_conditioning(prompts)
+                c = model_cond_stage.get_learned_conditioning(prompts)
+
+            if opt.optimize_memory and device.type != 'cpu':
+                # AMD ROCm reuses the CUDA interfaces, so hopefully this work on your GPU :^)
+                mem = torch.cuda.memory_allocated() / 1_000_000
+                model_cond_stage.to("cpu")
+                while torch.cuda.memory_allocated() / 1_000_000 >= mem:
+                    time.sleep(1)
 
             shape = [opt_C, height // opt_f, width // opt_f]
 
@@ -538,9 +581,18 @@ def process_images(
             x = create_random_tensors([opt_C, height // opt_f, width // opt_f], seeds=seeds)
             samples_ddim = func_sample(init_data=init_data, x=x, conditioning=c, unconditional_conditioning=uc, sampler_name=sampler_name)
 
+            if opt.optimize_memory and device.type != 'cpu':
+                model_first_stage.to(device)
 
-            x_samples_ddim = model.decode_first_stage(samples_ddim)
+            x_samples_ddim = model_first_stage.decode_first_stage(samples_ddim)
             x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+            if opt.optimize_memory and device.type != 'cpu':
+                mem = torch.cuda.memory_allocated() / 1_000_000
+                model_first_stage.to("cpu")
+                while torch.cuda.memory_allocated() / 1_000_000 >= mem:
+                    time.sleep(1)
+
             for i, x_sample in enumerate(x_samples_ddim):
                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                 x_sample = x_sample.astype(np.uint8)
@@ -553,7 +605,7 @@ def process_images(
                 if use_RealESRGAN and RealESRGAN is not None:
                     torch_gc()
                     if RealESRGAN.model.name != realesrgan_model_name:
-                        try_loading_RealESRGAN(realesrgan_model_name)
+                        load_realesrgan(realesrgan_model_name)
 
                     output, img_mode = RealESRGAN.enhance(x_sample[:,:,::-1])
                     x_sample = output[:,:,::-1]
@@ -568,7 +620,7 @@ def process_images(
 
                     if use_RealESRGAN and RealESRGAN is not None:
                         if RealESRGAN.model.name != realesrgan_model_name:
-                            try_loading_RealESRGAN(realesrgan_model_name)
+                            load_realesrgan(realesrgan_model_name)
                         output, img_mode = RealESRGAN.enhance(np.array(init_img, dtype=np.uint8))
                         init_img = Image.fromarray(output)
                         init_img = init_img.convert('RGB')
@@ -1070,7 +1122,7 @@ def run_GFPGAN(image, strength):
 
 def run_RealESRGAN(image, model_name: str):
     if RealESRGAN.model.name != model_name:
-            try_loading_RealESRGAN(model_name)
+        load_realesrgan(model_name)
 
     image = image.convert("RGB")
 
@@ -1423,28 +1475,36 @@ class ServerLauncher(threading.Thread):
     def stop(self):
         self.demo.close() # this tends to hang
 
-if opt.cli is None:
-    server_thread = ServerLauncher(demo)
-    server_thread.start()
 
-    try:
-        while server_thread.is_alive():
-            time.sleep(60)
-    except (KeyboardInterrupt, OSError) as e:
-        crash(e, 'Shutting down...')
-else:
-    with open(opt.cli, "r", encoding="utf8") as f:
-        kwargs = yaml.safe_load(f)
-    target = kwargs.pop("target")
-    if target == "txt2img":
-        target_func = txt2img
-    elif target == "img2img":
-        target_func = img2img
-        raise NotImplementedError()
+# entry_point console_scripts hook here
+# users can run `stable_diffusion` as a CLI command
+def main():
+    if opt.cli is None:
+        server_thread = ServerLauncher(demo)
+        server_thread.start()
+
+        try:
+            while server_thread.is_alive():
+                time.sleep(60)
+        except (KeyboardInterrupt, OSError) as e:
+            crash(e, 'Shutting down...')
     else:
-        raise ValueError(f"Unknown target: {target}")
-    kwargs["fp"] = None
-    output_images, seed, info, stats = target_func(**kwargs)
-    print(f"Seed: {seed}")
-    print(info)
-    print(stats)
+        with open(opt.cli, "r", encoding="utf8") as f:
+            kwargs = yaml.safe_load(f)
+        target = kwargs.pop("target")
+        if target == "txt2img":
+            target_func = txt2img
+        elif target == "img2img":
+            target_func = img2img
+            raise NotImplementedError()
+        else:
+            raise ValueError(f"Unknown target: {target}")
+        kwargs["fp"] = None
+        output_images, seed, info, stats = target_func(**kwargs)
+        print(f"Seed: {seed}")
+        print(info)
+        print(stats)
+
+
+if __name__ == '__main__':
+    main()
